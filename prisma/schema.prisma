@@ -1,0 +1,789 @@
+// ============================================================================
+// Girvi Ghata Management Platform — Prisma Schema
+// ============================================================================
+// Conventions used throughout:
+//  - Every tenant-owned table carries tenantId (+ branchId where relevant).
+//  - Money fields use Decimal(14,2) — never Float. Weight fields use
+//    Decimal(10,3) grams. Percentages use Decimal(6,3).
+//  - Soft delete via deletedAt — no hard deletes on business data (Section 41).
+//  - createdBy / updatedBy reference User.id for accountability.
+//  - Immutable snapshot tables (GirviValuationSnapshot, RateHistory,
+//    AuditLog) have no updatedAt/updatedBy — they are append-only.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// PLATFORM / TENANCY
+// ----------------------------------------------------------------------------
+
+model Tenant {
+  id           String    @id @default(uuid())
+  name         String
+  legalName    String?
+  gstin        String?
+  logoUrl      String?
+  primaryColor String?
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  pincode      String?
+  phone        String?
+  email        String?
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  branches          Branch[]
+  users             User[]
+  roles             Role[]
+  customers         Customer[]
+  metals            Metal[]
+  purities          Purity[]
+  metalRates        MetalRate[]
+  businessRules     BusinessRuleSet[]
+  girviTransactions GirviTransaction[]
+  numberSequences   NumberSequence[]
+  auditLogs         AuditLog[]
+  subscription      TenantSubscription?
+
+  @@map("tenants")
+}
+
+model SubscriptionPlan {
+  id           String   @id @default(uuid())
+  code         String   @unique // STARTER | PROFESSIONAL | ENTERPRISE
+  name         String
+  maxBranches  Int?
+  maxUsers     Int?
+  featureFlags Json // { "advancedReports": true, "whatsapp": false, ... }
+  createdAt    DateTime @default(now())
+
+  subscriptions TenantSubscription[]
+
+  @@map("subscription_plans")
+}
+
+model TenantSubscription {
+  id        String    @id @default(uuid())
+  tenantId  String    @unique
+  planId    String
+  startedAt DateTime  @default(now())
+  expiresAt DateTime?
+  isActive  Boolean   @default(true)
+
+  tenant Tenant           @relation(fields: [tenantId], references: [id])
+  plan   SubscriptionPlan @relation(fields: [planId], references: [id])
+
+  @@map("tenant_subscriptions")
+}
+
+model Branch {
+  id           String    @id @default(uuid())
+  tenantId     String
+  code         String // short code e.g. "MAIN"
+  name         String
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  pincode      String?
+  phone        String?
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  tenant Tenant       @relation(fields: [tenantId], references: [id])
+  users  UserBranch[]
+
+  @@unique([tenantId, code])
+  @@map("branches")
+}
+
+// ----------------------------------------------------------------------------
+// USERS / RBAC
+// ----------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(uuid())
+  tenantId     String
+  fullName     String
+  email        String?
+  phone        String?
+  passwordHash String
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  tokenVersion Int       @default(0) // bumped to invalidate all outstanding refresh tokens (logout-all, password change)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  tenant       Tenant         @relation(fields: [tenantId], references: [id])
+  branches     UserBranch[]
+  roles        UserRole[]
+  loginHistory LoginHistory[]
+
+  @@unique([tenantId, email])
+  @@map("users")
+}
+
+model UserBranch {
+  userId   String
+  branchId String
+
+  user   User   @relation(fields: [userId], references: [id])
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@id([userId, branchId])
+  @@map("user_branches")
+}
+
+model Role {
+  id        String   @id @default(uuid())
+  tenantId  String
+  name      String // e.g. "Business Owner", "Cashier" — editable per tenant
+  isSystem  Boolean  @default(false) // seeded default roles cannot be deleted
+  createdAt DateTime @default(now())
+
+  tenant      Tenant           @relation(fields: [tenantId], references: [id])
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@unique([tenantId, name])
+  @@map("roles")
+}
+
+model Permission {
+  id          String @id @default(uuid())
+  code        String @unique // e.g. "girvi:create", "rate:change", "kyc:view_full"
+  description String
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id])
+  permission Permission @relation(fields: [permissionId], references: [id])
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId String
+  roleId String
+
+  user User @relation(fields: [userId], references: [id])
+  role Role @relation(fields: [roleId], references: [id])
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+model LoginHistory {
+  id        String   @id @default(uuid())
+  userId    String
+  success   Boolean
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("login_history")
+}
+
+// ----------------------------------------------------------------------------
+// CUSTOMER / KYC
+// ----------------------------------------------------------------------------
+
+model Customer {
+  id           String    @id @default(uuid())
+  tenantId     String
+  branchId     String?
+  customerCode String // e.g. CUS-000001, per numbering rules
+  fullName     String
+  guardianName String? // father's/husband's name
+  mobile       String
+  altMobile    String?
+  dob          DateTime?
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  pincode      String?
+  photoUrl     String?
+  notes        String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  tenant            Tenant             @relation(fields: [tenantId], references: [id])
+  kyc               CustomerKyc?
+  documents         CustomerDocument[]
+  girviTransactions GirviTransaction[]
+
+  @@unique([tenantId, customerCode])
+  @@index([tenantId, mobile])
+  @@index([tenantId, fullName])
+  @@map("customers")
+}
+
+// Kept as a separate table so it can carry stricter, independent access
+// control / encryption from the general Customer profile (Section 6/63).
+model CustomerKyc {
+  id               String   @id @default(uuid())
+  customerId       String   @unique
+  aadhaarEncrypted String? // encrypted at application layer; only last-4 shown by default
+  aadhaarLast4     String?
+  panNumber        String? // PAN is not as sensitive as Aadhaar but still masked in UI
+  otherIdType      String?
+  otherIdNumber    String?
+  signatureUrl     String? // customer's permanent/reusable KYC signature — NOT the
+  // per-Girvi pledge acknowledgement, see GirviTransaction.customerSignatureUrl
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  @@map("customer_kyc")
+}
+
+model CustomerDocument {
+  id         String   @id @default(uuid())
+  customerId String
+  type       String // "aadhaar_front", "aadhaar_back", "pan", "photo", "other"
+  fileUrl    String
+  createdAt  DateTime @default(now())
+  createdBy  String
+
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  @@map("customer_documents")
+}
+
+// ----------------------------------------------------------------------------
+// METAL / RATES
+// ----------------------------------------------------------------------------
+
+model Metal {
+  id       String @id @default(uuid())
+  tenantId String
+  code     String // "GOLD" | "SILVER" | tenant-defined extension
+  name     String
+
+  tenant   Tenant      @relation(fields: [tenantId], references: [id])
+  purities Purity[]
+  rates    MetalRate[]
+
+  @@unique([tenantId, code])
+  @@map("metals")
+}
+
+model Purity {
+  id         String  @id @default(uuid())
+  tenantId   String
+  metalId    String
+  code       String
+  fineFactor Decimal @db.Decimal(6, 4)
+  isActive   Boolean @default(true)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  metal  Metal  @relation(fields: [metalId], references: [id])
+
+  @@unique([tenantId, metalId, code])
+  @@map("purities")
+}
+
+// Current effective rate per metal (rate management screen writes here).
+model MetalRate {
+  id            String    @id @default(uuid())
+  tenantId      String
+  branchId      String?
+  metalId       String
+  ratePerGram   Decimal   @db.Decimal(12, 2)
+  effectiveFrom DateTime  @default(now())
+  effectiveTo   DateTime?
+  createdBy     String
+  createdAt     DateTime  @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  metal  Metal  @relation(fields: [metalId], references: [id])
+
+  @@index([tenantId, metalId, effectiveFrom])
+  @@map("metal_rates")
+}
+
+// Append-only audit trail of every rate change (Section 13). Never updated.
+model MetalRateHistory {
+  id         String   @id @default(uuid())
+  tenantId   String
+  metalId    String
+  purityCode String?
+  oldRate    Decimal? @db.Decimal(12, 2)
+  newRate    Decimal  @db.Decimal(12, 2)
+  changedBy  String
+  changedAt  DateTime @default(now())
+
+  @@map("metal_rate_history")
+}
+
+// ----------------------------------------------------------------------------
+// BUSINESS RULES (versioned — never edited in place, Section 58/64)
+// ----------------------------------------------------------------------------
+
+model BusinessRuleSet {
+  id                     String   @id @default(uuid())
+  tenantId               String
+  version                Int // increments on every change; only latest is "active"
+  isActive               Boolean  @default(true)
+  metalCode              String // "GOLD" | "SILVER" — rules can differ per metal
+  eligibilityPercent     Decimal  @db.Decimal(6, 3) // e.g. 70.000
+  marginType             String // "FIXED" | "PERCENT" | "NONE"
+  marginValue            Decimal  @db.Decimal(12, 2)
+  interestMethod         String // "FLAT_MONTHLY" | "DAILY" | "REDUCING_BALANCE"
+  interestPercent        Decimal  @db.Decimal(6, 3) // e.g. 2.000
+  gracePeriodDays        Int      @default(0)
+  loanTermDays           Int? // null = open-ended
+  roundingRule           String // "NONE" | "ROUND_NEAREST_1" | "ROUND_NEAREST_10" | ...
+  minLoanAmount          Decimal? @db.Decimal(14, 2)
+  maxLoanAmount          Decimal? @db.Decimal(14, 2)
+  paymentAllocationOrder Json // e.g. ["PENALTY","CHARGES","INTEREST","PRINCIPAL"]
+  createdBy              String
+  createdAt              DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, metalCode, version])
+  @@map("business_rule_sets")
+}
+
+// ----------------------------------------------------------------------------
+// GIRVI TRANSACTION / PLEDGED ITEMS
+// ----------------------------------------------------------------------------
+
+model GirviTransaction {
+  id                   String      @id @default(uuid())
+  tenantId             String
+  branchId             String
+  girviNumber          String // e.g. GRV-2026-000001, from NumberSequence
+  customerId           String
+  status               GirviStatus @default(DRAFT)
+  pledgeDate           DateTime    @default(now())
+  dueDate              DateTime?
+  // Customer's signature/acknowledgement captured specifically for THIS
+  // pledge transaction — distinct from CustomerKyc.signatureUrl, which is
+  // the customer's one-time, reusable identity signature. Nullable and
+  // optional at the API level (see CreateGirviDto) for backward
+  // compatibility with existing callers/tests; the frontend enforces it
+  // as required before allowing submission.
+  customerSignatureUrl String?
+  createdBy            String
+  updatedBy            String?
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+  deletedAt            DateTime?
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id])
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  items            PledgedItem[]
+  valuation        GirviValuationSnapshot?
+  payments         Payment[]
+  redemption       Redemption?
+  packet           Packet?
+  auctionCase      AuctionCase?
+  interestAccruals InterestAccrual[]
+  topUps           GirviTopUp[]
+
+  @@unique([tenantId, girviNumber])
+  @@index([tenantId, status])
+  @@index([tenantId, customerId])
+  @@map("girvi_transactions")
+}
+
+// New model — a top-up is an explicit, separately-audited addition to an
+// active loan's principal. Never mutates GirviValuationSnapshot (which
+// stays the immutable record of what was calculated at pledge time).
+// Each top-up carries its own interest-anchor decision, made explicit
+// by the owner at the time of the top-up rather than inferred.
+
+model GirviTopUp {
+  id                             String   @id @default(uuid())
+  tenantId                       String
+  girviTransactionId             String
+  amount                         Decimal  @db.Decimal(14, 2)
+  // The actual date the additional money was given — may be backdated
+  // for historical entry, same convention as GirviTransaction.pledgeDate
+  // and Payment.paymentDate.
+  topUpDate                      DateTime
+  // true  -> this top-up's interest is calculated using the ORIGINAL
+  //          Girvi's pledgeDate as the calendar-month anchor (as if it
+  //          had always been part of the original principal).
+  // false -> this top-up's interest is calculated using its OWN
+  //          topUpDate as the calendar-month anchor (a fresh interest
+  //          cycle starting from the top-up's month).
+  // Enforced server-side in OutstandingService — never trusted from a
+  // pre-computed frontend number.
+  applyPreviousInterestStartDate Boolean
+  createdBy                      String
+  createdAt                      DateTime @default(now())
+
+  girviTransaction GirviTransaction @relation(fields: [girviTransactionId], references: [id])
+
+  @@index([tenantId, girviTransactionId])
+  @@map("girvi_topups")
+}
+
+enum GirviStatus {
+  DRAFT
+  ACTIVE
+  PARTIALLY_PAID
+  OVERDUE
+  RENEWED
+  CLOSED
+  REDEEMED
+  AUCTION_ELIGIBLE
+  AUCTIONED
+  CANCELLED
+}
+
+model PledgedItem {
+  id                 String    @id @default(uuid())
+  girviTransactionId String
+  itemType           String // "chain", "ring", "earrings", ...
+  description        String?
+  metalCode          String
+  purityCode         String
+  grossWeight        Decimal   @db.Decimal(10, 3)
+  stoneWeight        Decimal   @default(0) @db.Decimal(10, 3)
+  netWeight          Decimal   @db.Decimal(10, 3) // grossWeight - stoneWeight
+  condition          String? // "New" | "Good" | "Used" | "Damaged" | ...
+  conditionNotes     String?
+  hallmark           String?
+  huid               String?
+  createdAt          DateTime  @default(now())
+  deletedAt          DateTime?
+
+  girviTransaction GirviTransaction @relation(fields: [girviTransactionId], references: [id])
+  photos           ItemPhoto[]
+
+  @@map("pledged_items")
+}
+
+model ItemPhoto {
+  id            String   @id @default(uuid())
+  pledgedItemId String
+  angle         String // "front" | "back" | "hallmark" | "damage" | "other"
+  fileUrl       String
+  createdAt     DateTime @default(now())
+
+  pledgedItem PledgedItem @relation(fields: [pledgedItemId], references: [id])
+
+  @@map("item_photos")
+}
+
+// The frozen calculation for a transaction — written once at pledge time,
+// never mutated afterwards (Section 12/64/67). If a mistake is found, create
+// an adjustment record referencing this one; do not edit it.
+model GirviValuationSnapshot {
+  id                   String   @id @default(uuid())
+  girviTransactionId   String   @unique
+  ruleSetId            String // which BusinessRuleSet version was used
+  metalRateId          String // which MetalRate row / rate value was used
+  totalFineWeight      Decimal  @db.Decimal(10, 4)
+  totalMetalValue      Decimal  @db.Decimal(14, 2)
+  eligibilityPercent   Decimal  @db.Decimal(6, 3)
+  eligibleValue        Decimal  @db.Decimal(14, 2)
+  marginApplied        Decimal  @db.Decimal(14, 2)
+  maxLoanAmount        Decimal  @db.Decimal(14, 2)
+  actualLoanAmount     Decimal  @db.Decimal(14, 2) // what was actually disbursed
+  calculationBreakdown Json // full step-by-step formula trace for "explain this" UI
+  interestPercent     Decimal  @db.Decimal(6, 3)
+  createdBy            String
+  createdAt            DateTime @default(now())
+
+  girviTransaction GirviTransaction @relation(fields: [girviTransactionId], references: [id])
+
+  @@map("girvi_valuation_snapshots")
+}
+
+model InterestAccrual {
+  id                 String   @id @default(uuid())
+  girviTransactionId String
+  periodStart        DateTime
+  periodEnd          DateTime
+  principalBase      Decimal  @db.Decimal(14, 2)
+  interestAmount     Decimal  @db.Decimal(14, 2)
+  method             String
+  createdAt          DateTime @default(now())
+
+  girviTransaction GirviTransaction @relation(fields: [girviTransactionId], references: [id])
+
+  @@map("interest_accruals")
+}
+
+// ----------------------------------------------------------------------------
+// PAYMENTS / LEDGER
+// ----------------------------------------------------------------------------
+
+model Payment {
+  id                 String   @id @default(uuid())
+  tenantId           String
+  girviTransactionId String
+  receiptNumber      String // PAY-2026-000001
+  amount             Decimal  @db.Decimal(14, 2)
+  mode               String // "CASH" | "UPI" | "BANK" | "OTHER"
+  referenceNumber    String?
+  // The actual date the payment was physically received — may be
+  // backdated for historical entry. Distinct from createdAt, which is
+  // always the moment the record was entered into the system. Defaults
+  // to now() so this column is safe to add non-destructively to an
+  // existing table; existing rows get their createdAt-equivalent moment
+  // as their paymentDate at migration time, then every new payment
+  // explicitly sets it going forward (see PaymentsService).
+  paymentDate        DateTime @default(now())
+  receivedBy         String
+  notes              String?
+  isReversed         Boolean  @default(false)
+  reversalReason     String?
+  createdAt          DateTime @default(now())
+
+  girviTransaction GirviTransaction    @relation(fields: [girviTransactionId], references: [id])
+  allocations      PaymentAllocation[]
+  ledgerEntries    CashLedgerEntry[]
+
+  @@unique([tenantId, receiptNumber])
+  @@map("payments")
+}
+
+model PaymentAllocation {
+  id        String  @id @default(uuid())
+  paymentId String
+  category  String // "PENALTY" | "CHARGES" | "INTEREST" | "PRINCIPAL"
+  amount    Decimal @db.Decimal(14, 2)
+
+  payment Payment @relation(fields: [paymentId], references: [id])
+
+  @@map("payment_allocations")
+}
+
+model Redemption {
+  id                 String   @id @default(uuid())
+  girviTransactionId String   @unique
+  redemptionNumber   String // RED-2026-000001
+  amountPaid         Decimal  @db.Decimal(14, 2)
+  releasedBy         String
+  customerAckUrl     String? // signature/photo acknowledgement
+  redeemedAt         DateTime @default(now())
+
+  girviTransaction GirviTransaction @relation(fields: [girviTransactionId], references: [id])
+
+  @@map("redemptions")
+}
+
+model CashLedgerEntry {
+  id          String   @id @default(uuid())
+  tenantId    String
+  branchId    String
+  entryType   String // "LOAN_DISBURSEMENT" | "PAYMENT_RECEIVED" | "EXPENSE" | ...
+  direction   String // "IN" | "OUT"
+  amount      Decimal  @db.Decimal(14, 2)
+  accountType String // "CASH" | "BANK" | "UPI" | "OTHER"
+  paymentId   String?
+  expenseId   String?
+  createdBy   String
+  createdAt   DateTime @default(now())
+
+  payment Payment? @relation(fields: [paymentId], references: [id])
+  expense Expense? @relation(fields: [expenseId], references: [id])
+
+  @@index([tenantId, branchId, createdAt])
+  @@map("cash_ledger_entries")
+}
+
+model Expense {
+  id          String   @id @default(uuid())
+  tenantId    String
+  branchId    String
+  category    String
+  amount      Decimal  @db.Decimal(14, 2)
+  paymentMode String
+  description String?
+  receiptUrl  String?
+  createdBy   String
+  createdAt   DateTime @default(now())
+
+  ledgerEntries CashLedgerEntry[]
+
+  @@map("expenses")
+}
+
+// Records the staff-entered actual cash count at day-end against the
+// system's expected cash, with a required reason for any discrepancy
+// (Section 28).
+model DailyClosing {
+  id                String   @id @default(uuid())
+  tenantId          String
+  branchId          String
+  closingDate       DateTime // date-only, time zeroed
+  expectedCash      Decimal  @db.Decimal(14, 2)
+  actualCash        Decimal  @db.Decimal(14, 2)
+  discrepancy       Decimal  @db.Decimal(14, 2)
+  discrepancyReason String?
+  closedBy          String
+  createdAt         DateTime @default(now())
+
+  @@unique([tenantId, branchId, closingDate])
+  @@map("daily_closings")
+}
+
+// ----------------------------------------------------------------------------
+// VAULT / INVENTORY
+// ----------------------------------------------------------------------------
+
+model StorageLocation {
+  id       String  @id @default(uuid())
+  tenantId String
+  branchId String
+  type     String // "VAULT" | "LOCKER" | "RACK" | "TRAY" | "SHELF"
+  code     String
+  parentId String?
+
+  parent   StorageLocation?  @relation("LocationHierarchy", fields: [parentId], references: [id])
+  children StorageLocation[] @relation("LocationHierarchy")
+  packets  Packet[]
+
+  @@unique([tenantId, branchId, type, code])
+  @@map("storage_locations")
+}
+
+model Packet {
+  id                 String   @id @default(uuid())
+  girviTransactionId String   @unique
+  packetNumber       String
+  qrCode             String   @unique
+  storageLocationId  String?
+  createdAt          DateTime @default(now())
+
+  girviTransaction GirviTransaction @relation(fields: [girviTransactionId], references: [id])
+  storageLocation  StorageLocation? @relation(fields: [storageLocationId], references: [id])
+
+  @@map("packets")
+}
+
+// ----------------------------------------------------------------------------
+// AUCTION
+// ----------------------------------------------------------------------------
+
+model AuctionCase {
+  id                 String    @id @default(uuid())
+  girviTransactionId String    @unique
+  status             String // "NOTICE" | "AUCTION_ELIGIBLE" | "SCHEDULED" | "AUCTIONED" | "CLOSED"
+  noticeSentAt       DateTime?
+  eligibleAt         DateTime?
+  scheduledAt        DateTime?
+  createdBy          String
+  createdAt          DateTime  @default(now())
+
+  girviTransaction GirviTransaction   @relation(fields: [girviTransactionId], references: [id])
+  settlement       AuctionSettlement?
+
+  @@map("auction_cases")
+}
+
+model AuctionSettlement {
+  id                   String    @id @default(uuid())
+  auctionCaseId        String    @unique
+  outstandingPrincipal Decimal   @db.Decimal(14, 2)
+  outstandingInterest  Decimal   @db.Decimal(14, 2)
+  otherCharges         Decimal   @db.Decimal(14, 2)
+  reservePrice         Decimal   @db.Decimal(14, 2)
+  finalSaleAmount      Decimal?  @db.Decimal(14, 2)
+  buyerName            String?
+  soldAt               DateTime?
+  profitOrLoss         Decimal?  @db.Decimal(14, 2)
+  createdAt            DateTime  @default(now())
+
+  auctionCase AuctionCase @relation(fields: [auctionCaseId], references: [id])
+
+  @@map("auction_settlements")
+}
+
+// ----------------------------------------------------------------------------
+// SYSTEM: NUMBERING, NOTIFICATIONS, AUDIT
+// ----------------------------------------------------------------------------
+
+model NumberSequence {
+  id        String  @id @default(uuid())
+  tenantId  String
+  entity    String // "GIRVI" | "PAYMENT" | "REDEMPTION" | "CUSTOMER" | "EXPENSE"
+  prefix    String // "GRV"
+  yearInKey Boolean @default(true)
+  lastValue Int     @default(0)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, entity])
+  @@map("number_sequences")
+}
+
+model NotificationTemplate {
+  id       String @id @default(uuid())
+  tenantId String
+  event    String // "PAYMENT_DUE" | "OVERDUE" | "AUCTION_WARNING" | ...
+  channel  String // "WHATSAPP" | "SMS" | "EMAIL"
+  body     String
+
+  @@unique([tenantId, event, channel])
+  @@map("notification_templates")
+}
+
+model Notification {
+  id         String    @id @default(uuid())
+  tenantId   String
+  customerId String?
+  channel    String
+  event      String
+  status     String // "PENDING" | "SENT" | "FAILED"
+  sentAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@map("notifications")
+}
+
+// Append-only. Never updated or deleted (Section 42).
+model AuditLog {
+  id         String   @id @default(uuid())
+  tenantId   String
+  actorId    String?
+  action     String // "RATE_CHANGE" | "CUSTOMER_EDIT" | "PAYMENT_CANCEL" | ...
+  entityType String
+  entityId   String
+  oldValue   Json?
+  newValue   Json?
+  reason     String?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, entityType, entityId])
+  @@index([tenantId, createdAt])
+  @@map("audit_logs")
+}

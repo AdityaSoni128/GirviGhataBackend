@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: girvi_user
+          POSTGRES_PASSWORD: girvi_pass
+          POSTGRES_DB: girvi_ghata_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U girvi_user -d girvi_ghata_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: "postgresql://girvi_user:girvi_pass@localhost:5432/girvi_ghata_test?schema=public"
+      JWT_ACCESS_SECRET: "ci-test-access-secret"
+      JWT_REFRESH_SECRET: "ci-test-refresh-secret"
+      JWT_ACCESS_EXPIRES_IN: "15m"
+      JWT_REFRESH_EXPIRES_IN: "7d"
+      KYC_ENCRYPTION_KEY: "ci-test-32-byte-key-0000000000000"
+      NODE_ENV: "test"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Run migrations against the test database
+        run: npx prisma migrate deploy
+
+      - name: Unit tests (calculation engine)
+        run: npm test -- --testPathPattern='\.spec\.ts$'
+
+      - name: Integration/e2e tests (auth, tenancy isolation, loan lifecycle)
+        run: npm run test:e2e
+
+      - name: Build
+        run: npm run build
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image (no push — wire up a registry login step before enabling push)
+        run: docker build -t girvi-ghata-backend:ci .

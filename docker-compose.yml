@@ -1,0 +1,52 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: girvi_user
+      POSTGRES_PASSWORD: girvi_pass
+      POSTGRES_DB: girvi_ghata
+    ports:
+      - "5432:5432"
+    volumes:
+      - girvi_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U girvi_user -d girvi_ghata"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: "postgresql://girvi_user:girvi_pass@postgres:5432/girvi_ghata?schema=public"
+      REDIS_URL: "redis://redis:6379"
+      PORT: 3000
+      NODE_ENV: production
+      # JWT_ACCESS_SECRET / JWT_REFRESH_SECRET / KYC_ENCRYPTION_KEY must be
+      # supplied via a real secret store in production — not committed here.
+      # Compose reads them from a local .env file (see .env.example) if present.
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-change-me-access-secret}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-change-me-refresh-secret}
+      KYC_ENCRYPTION_KEY: ${KYC_ENCRYPTION_KEY:-change-me-32-byte-key-000000000}
+    ports:
+      - "3000:3000"
+
+volumes:
+  girvi_postgres_data:

@@ -1,0 +1,482 @@
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { Decimal } from 'decimal.js';
+import { PrismaService } from '../../common/prisma/prisma.service';
+import { NumberSequenceService } from '../../common/numbering/number-sequence.service';
+import { RequestContext } from '../../common/decorators/current-context.decorator';
+import { CalculationEngineService } from '../calculation-engine/calculation-engine.service';
+import { RulesService } from '../rules/rules.service';
+import { CreateGirviDto } from './dto/create-girvi.dto';
+import { CreateTopUpDto } from './dto/create-topup.dto';
+import { ItemMeasurement, RateSnapshot } from '../calculation-engine/calculation.types';
+
+@Injectable()
+export class GirviService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly sequences: NumberSequenceService,
+    private readonly engine: CalculationEngineService,
+    private readonly rules: RulesService,
+  ) {}
+
+  /**
+   * Creates a Girvi transaction. Every number here is recalculated
+   * server-side from stored rates/rules/purities — the DTO's
+   * requestedLoanAmount is only ever *validated against*, never trusted.
+   * Items may span multiple metals; each metal group is valued against
+   * its own rate and rule set, then combined.
+   *
+   * Interest-rate locking: dto.interestPercent (if supplied) is
+   * range-validated here and stored on the valuation snapshot as the
+   * PERMANENT rate for this transaction — see the field's doc comment
+   * in schema.prisma. When omitted, the active rule's rate is used as
+   * the default, matching prior behavior exactly.
+   */
+  async create(ctx: RequestContext, dto: CreateGirviDto) {
+    const customer = await this.prisma.customer.findFirst({
+      where: { id: dto.customerId, tenantId: ctx.tenantId, deletedAt: null },
+    });
+    if (!customer) throw new NotFoundException('Customer not found');
+
+    const now = new Date();
+    const pledgeDate = dto.pledgeDate ? new Date(dto.pledgeDate) : now;
+    if (Number.isNaN(pledgeDate.getTime())) {
+      throw new BadRequestException('pledgeDate is not a valid date');
+    }
+    if (pledgeDate.getTime() > now.getTime()) {
+      throw new BadRequestException('Pledge date cannot be in the future');
+    }
+
+    const metalCodes = Array.from(new Set(dto.items.map((i) => i.metalCode)));
+
+    const purityMaps: Record<string, Map<string, Decimal>> = {};
+    const rates: Record<string, RateSnapshot> = {};
+    const ruleSets: Record<string, Awaited<ReturnType<RulesService['getActiveRules']>>> = {};
+
+    for (const metalCode of metalCodes) {
+      const metal = await this.prisma.metal.findFirst({
+        where: { tenantId: ctx.tenantId, code: metalCode },
+        include: { purities: true },
+      });
+      if (!metal) throw new BadRequestException(`Metal ${metalCode} not configured`);
+
+      purityMaps[metalCode] = new Map(
+        metal.purities.map((p) => [p.code, new Decimal(p.fineFactor.toString())]),
+      );
+
+      const currentRate = await this.prisma.metalRate.findFirst({
+        where: { tenantId: ctx.tenantId, metalId: metal.id, effectiveTo: null },
+        orderBy: { effectiveFrom: 'desc' },
+      });
+      if (!currentRate) throw new BadRequestException(`No current rate set for ${metalCode}`);
+
+      rates[metalCode] = {
+        metalCode,
+        ratePerGram: new Decimal(currentRate.ratePerGram.toString()),
+        rateId: currentRate.id,
+      };
+
+      ruleSets[metalCode] = await this.rules.getActiveRules(ctx.tenantId, metalCode);
+    }
+
+    const itemsByMetal: Record<string, ItemMeasurement[]> = {};
+    for (const item of dto.items) {
+      const fineFactor = purityMaps[item.metalCode].get(item.purityCode);
+      if (!fineFactor) {
+        throw new BadRequestException(
+          `Purity ${item.purityCode} is not configured for ${item.metalCode}`,
+        );
+      }
+      itemsByMetal[item.metalCode] = itemsByMetal[item.metalCode] || [];
+      itemsByMetal[item.metalCode].push({
+        itemId: `${item.metalCode}-${itemsByMetal[item.metalCode].length}`,
+        grossWeight: new Decimal(item.grossWeight),
+        stoneWeight: new Decimal(item.stoneWeight ?? '0'),
+        purityCode: item.purityCode,
+        fineFactor,
+      });
+    }
+
+    let combinedMaxLoan = new Decimal(0);
+    let combinedEligibleValue = new Decimal(0);
+    let combinedFineWeight = new Decimal(0);
+    let combinedMetalValue = new Decimal(0);
+    let combinedMargin = new Decimal(0);
+    const perMetalBreakdown: Record<string, unknown> = {};
+
+    for (const metalCode of metalCodes) {
+      const result = this.engine.calculatePledgeValue(
+        itemsByMetal[metalCode],
+        rates,
+        ruleSets[metalCode],
+        metalCode,
+      );
+      combinedMaxLoan = combinedMaxLoan.plus(result.maxLoanAmount);
+      combinedEligibleValue = combinedEligibleValue.plus(result.eligibleValue);
+      combinedFineWeight = combinedFineWeight.plus(result.totalFineWeight);
+      combinedMetalValue = combinedMetalValue.plus(result.totalMetalValue);
+      combinedMargin = combinedMargin.plus(result.marginApplied);
+      perMetalBreakdown[metalCode] = result.breakdown;
+    }
+
+    const requestedLoanAmount = new Decimal(dto.requestedLoanAmount);
+    if (requestedLoanAmount.greaterThan(combinedMaxLoan)) {
+      throw new BadRequestException(
+        `Requested loan ₹${requestedLoanAmount.toString()} exceeds the maximum eligible amount ` +
+          `₹${combinedMaxLoan.toString()} calculated from current rates and rules.`,
+      );
+    }
+    if (requestedLoanAmount.lessThanOrEqualTo(0)) {
+      throw new BadRequestException('Requested loan amount must be greater than zero');
+    }
+
+    const primaryRuleMetal = metalCodes.includes('GOLD') ? 'GOLD' : metalCodes[0];
+    const primaryRules = ruleSets[primaryRuleMetal];
+
+    // Lock in the interest rate for this specific transaction (Section 2
+    // of the interest-rate-locking requirement). Defaults to the active
+    // rule's rate — identical to prior behavior — when the owner didn't
+    // override it.
+    let lockedInterestPercent: Decimal;
+    if (dto.interestPercent !== undefined) {
+      lockedInterestPercent = new Decimal(dto.interestPercent);
+      if (lockedInterestPercent.isNegative()) {
+        throw new BadRequestException('Interest rate cannot be negative');
+      }
+      if (lockedInterestPercent.greaterThan(100)) {
+        throw new BadRequestException('Interest rate cannot exceed 100%');
+      }
+    } else {
+      lockedInterestPercent = primaryRules.interestPercent;
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const girviNumber = await this.sequences.next(tx, ctx.tenantId, 'GIRVI');
+
+      const dueDate = primaryRules.loanTermDays
+        ? new Date(pledgeDate.getTime() + primaryRules.loanTermDays * 24 * 60 * 60 * 1000)
+        : null;
+
+      const transaction = await tx.girviTransaction.create({
+        data: {
+          tenantId: ctx.tenantId,
+          branchId: dto.branchId,
+          girviNumber,
+          customerId: dto.customerId,
+          status: 'ACTIVE',
+          pledgeDate,
+          dueDate,
+          customerSignatureUrl: dto.customerSignatureUrl,
+          createdBy: ctx.userId,
+        },
+      });
+
+      for (const item of dto.items) {
+        const fineFactor = purityMaps[item.metalCode].get(item.purityCode)!;
+        const grossWeight = new Decimal(item.grossWeight);
+        const stoneWeight = new Decimal(item.stoneWeight ?? '0');
+        const netWeight = grossWeight.minus(stoneWeight);
+
+        await tx.pledgedItem.create({
+          data: {
+            girviTransactionId: transaction.id,
+            itemType: item.itemType,
+            description: item.description,
+            metalCode: item.metalCode,
+            purityCode: item.purityCode,
+            grossWeight: grossWeight.toString(),
+            stoneWeight: stoneWeight.toString(),
+            netWeight: netWeight.toString(),
+            condition: item.condition,
+            conditionNotes: item.conditionNotes,
+            hallmark: item.hallmark,
+            huid: item.huid,
+          },
+        });
+      }
+
+      await tx.girviValuationSnapshot.create({
+        data: {
+          girviTransactionId: transaction.id,
+          ruleSetId: primaryRules.ruleSetDbId,
+          metalRateId: rates[primaryRuleMetal].rateId,
+          totalFineWeight: combinedFineWeight.toString(),
+          totalMetalValue: combinedMetalValue.toString(),
+          eligibilityPercent: primaryRules.eligibilityPercent.toString(),
+          eligibleValue: combinedEligibleValue.toString(),
+          marginApplied: combinedMargin.toString(),
+          maxLoanAmount: combinedMaxLoan.toString(),
+          actualLoanAmount: requestedLoanAmount.toString(),
+          interestPercent: lockedInterestPercent.toString(),
+          calculationBreakdown: perMetalBreakdown.toString(),
+          createdBy: ctx.userId,
+        },
+      });
+
+      await tx.cashLedgerEntry.create({
+        data: {
+          tenantId: ctx.tenantId,
+          branchId: dto.branchId,
+          entryType: 'LOAN_DISBURSEMENT',
+          direction: 'OUT',
+          amount: requestedLoanAmount.toString(),
+          accountType: 'CASH',
+          createdBy: ctx.userId,
+        },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          tenantId: ctx.tenantId,
+          actorId: ctx.userId,
+          action: 'GIRVI_CREATE',
+          entityType: 'GirviTransaction',
+          entityId: transaction.id,
+          newValue: {
+            girviNumber,
+            customerId: dto.customerId,
+            loanAmount: requestedLoanAmount.toString(),
+            itemCount: dto.items.length,
+            pledgeDate: pledgeDate.toISOString(),
+            backdated: dto.pledgeDate ? pledgeDate.toDateString() !== now.toDateString() : false,
+            hasSignature: !!dto.customerSignatureUrl,
+            interestPercent: lockedInterestPercent.toString(),
+            interestRateOverridden: dto.interestPercent !== undefined,
+          },
+        },
+      });
+
+      return tx.girviTransaction.findUniqueOrThrow({
+        where: { id: transaction.id },
+        include: { items: true, valuation: true },
+      });
+    });
+  }
+
+  async topUp(ctx: RequestContext, girviId: string, dto: CreateTopUpDto) {
+    const transaction = await this.prisma.girviTransaction.findFirst({
+      where: { id: girviId, tenantId: ctx.tenantId },
+      include: { items: true, valuation: true, topUps: true },
+    });
+    if (!transaction || !transaction.valuation) {
+      throw new NotFoundException('Girvi transaction or its valuation snapshot not found');
+    }
+    if (!['ACTIVE', 'PARTIALLY_PAID', 'OVERDUE', 'RENEWED'].includes(transaction.status)) {
+      throw new BadRequestException(
+        `Cannot top up a transaction with status ${transaction.status}`,
+      );
+    }
+
+    const amount = new Decimal(dto.amount);
+    if (amount.lessThanOrEqualTo(0)) {
+      throw new BadRequestException('Top-up amount must be greater than zero');
+    }
+
+    const now = new Date();
+    const topUpDate = dto.topUpDate ? new Date(dto.topUpDate) : now;
+    if (Number.isNaN(topUpDate.getTime())) {
+      throw new BadRequestException('topUpDate is not a valid date');
+    }
+    if (topUpDate.getTime() > now.getTime()) {
+      throw new BadRequestException('Top-up date cannot be in the future');
+    }
+    if (topUpDate.getTime() < transaction.pledgeDate.getTime()) {
+      throw new BadRequestException('Top-up date cannot be earlier than the Girvi pledge date');
+    }
+
+    const currentValuation = await this.computeCurrentValuation(ctx.tenantId, transaction);
+    const existingPrincipalIssued = new Decimal(transaction.valuation.actualLoanAmount.toString()).plus(
+      transaction.topUps.reduce((sum, t) => sum.plus(t.amount.toString()), new Decimal(0)),
+    );
+    const newTotalPrincipal = existingPrincipalIssued.plus(amount);
+
+    if (newTotalPrincipal.greaterThan(currentValuation.currentMaxLoanAmount)) {
+      throw new BadRequestException(
+        `Top-up of ₹${amount.toString()} would bring total principal to ₹${newTotalPrincipal.toString()}, ` +
+          `exceeding the CURRENT maximum eligible amount of ₹${currentValuation.currentMaxLoanAmount.toString()} ` +
+          `(recalculated at today's rate).`,
+      );
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const topUp = await tx.girviTopUp.create({
+        data: {
+          tenantId: ctx.tenantId,
+          girviTransactionId: transaction.id,
+          amount: amount.toString(),
+          topUpDate,
+          applyPreviousInterestStartDate: dto.applyPreviousInterestStartDate,
+          createdBy: ctx.userId,
+        },
+      });
+
+      await tx.cashLedgerEntry.create({
+        data: {
+          tenantId: ctx.tenantId,
+          branchId: transaction.branchId,
+          entryType: 'LOAN_TOPUP',
+          direction: 'OUT',
+          amount: amount.toString(),
+          accountType: 'CASH',
+          createdBy: ctx.userId,
+        },
+      });
+
+      await tx.girviTransaction.update({
+        where: { id: transaction.id },
+        data: { updatedBy: ctx.userId },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          tenantId: ctx.tenantId,
+          actorId: ctx.userId,
+          action: 'GIRVI_TOPUP',
+          entityType: 'GirviTransaction',
+          entityId: transaction.id,
+          newValue: {
+            topUpId: topUp.id,
+            amount: amount.toString(),
+            topUpDate: topUpDate.toISOString(),
+            applyPreviousInterestStartDate: dto.applyPreviousInterestStartDate,
+            backdated: dto.topUpDate ? topUpDate.toDateString() !== now.toDateString() : false,
+          },
+        },
+      });
+
+      return tx.girviTopUp.findUniqueOrThrow({ where: { id: topUp.id } });
+    });
+  }
+
+  async getCurrentValuation(ctx: RequestContext, girviId: string) {
+    const transaction = await this.prisma.girviTransaction.findFirst({
+      where: { id: girviId, tenantId: ctx.tenantId },
+      include: { items: true, valuation: true },
+    });
+    if (!transaction || !transaction.valuation) {
+      throw new NotFoundException('Girvi transaction or its valuation snapshot not found');
+    }
+
+    const current = await this.computeCurrentValuation(ctx.tenantId, transaction);
+
+    return {
+      pledgeValuation: {
+        totalFineWeight: transaction.valuation.totalFineWeight.toString(),
+        totalMetalValue: transaction.valuation.totalMetalValue.toString(),
+        eligibilityPercent: transaction.valuation.eligibilityPercent.toString(),
+        eligibleValue: transaction.valuation.eligibleValue.toString(),
+        maxLoanAmount: transaction.valuation.maxLoanAmount.toString(),
+        actualLoanAmount: transaction.valuation.actualLoanAmount.toString(),
+        interestPercent: transaction.valuation.interestPercent.toString(),
+      },
+      currentValuation: {
+        rates: current.rates,
+        totalFineWeight: current.totalFineWeight.toString(),
+        totalMetalValue: current.totalMetalValue.toString(),
+        eligibilityPercent: current.eligibilityPercent,
+        currentEligibleValue: current.currentEligibleValue.toString(),
+        currentMaxLoanAmount: current.currentMaxLoanAmount.toString(),
+      },
+    };
+  }
+
+  private async computeCurrentValuation(
+    tenantId: string,
+    transaction: { items: Array<{ metalCode: string; purityCode: string; netWeight: any }> },
+  ) {
+    const metalCodes = Array.from(new Set(transaction.items.map((i) => i.metalCode)));
+
+    let totalFineWeight = new Decimal(0);
+    let totalMetalValue = new Decimal(0);
+    let totalEligibleValue = new Decimal(0);
+    let totalMaxLoan = new Decimal(0);
+    const ratesUsed: Record<string, string> = {};
+    let eligibilityPercentDisplay = '';
+
+    for (const metalCode of metalCodes) {
+      const metal = await this.prisma.metal.findFirst({
+        where: { tenantId, code: metalCode },
+        include: { purities: true },
+      });
+      if (!metal) continue;
+
+      const currentRate = await this.prisma.metalRate.findFirst({
+        where: { tenantId, metalId: metal.id, effectiveTo: null },
+        orderBy: { effectiveFrom: 'desc' },
+      });
+      if (!currentRate) continue;
+
+      ratesUsed[metalCode] = currentRate.ratePerGram.toString();
+
+      const rules = await this.rules.getActiveRules(tenantId, metalCode);
+      eligibilityPercentDisplay = rules.eligibilityPercent.toString();
+
+      const purityMap = new Map(metal.purities.map((p) => [p.code, new Decimal(p.fineFactor.toString())]));
+      const itemsForMetal = transaction.items.filter((i) => i.metalCode === metalCode);
+
+      let metalFineWeight = new Decimal(0);
+      for (const item of itemsForMetal) {
+        const fineFactor = purityMap.get(item.purityCode);
+        if (!fineFactor) continue;
+        metalFineWeight = metalFineWeight.plus(
+          this.engine.calculateFineWeight(new Decimal(item.netWeight.toString()), fineFactor),
+        );
+      }
+
+      const rate = new Decimal(currentRate.ratePerGram.toString());
+      const metalValue = this.engine.calculateMetalValue(metalFineWeight, rate);
+      const eligibleValue = this.engine.calculateEligibleValue(metalValue, rules.eligibilityPercent);
+      const margin =
+        rules.marginType === 'NONE'
+          ? new Decimal(0)
+          : rules.marginType === 'FIXED'
+            ? rules.marginValue
+            : eligibleValue.times(rules.marginValue).dividedBy(100);
+      const maxLoan = this.engine.applyMargin(eligibleValue, margin, rules);
+
+      totalFineWeight = totalFineWeight.plus(metalFineWeight);
+      totalMetalValue = totalMetalValue.plus(metalValue);
+      totalEligibleValue = totalEligibleValue.plus(eligibleValue);
+      totalMaxLoan = totalMaxLoan.plus(maxLoan);
+    }
+
+    return {
+      rates: ratesUsed,
+      totalFineWeight,
+      totalMetalValue,
+      eligibilityPercent: eligibilityPercentDisplay,
+      currentEligibleValue: totalEligibleValue,
+      currentMaxLoanAmount: totalMaxLoan,
+    };
+  }
+
+  async findOne(ctx: RequestContext, girviId: string) {
+    const transaction = await this.prisma.girviTransaction.findFirst({
+      where: { id: girviId, tenantId: ctx.tenantId },
+      include: {
+        customer: true,
+        items: { include: { photos: true } },
+        valuation: true,
+        payments: { orderBy: { paymentDate: 'asc' } },
+        topUps: { orderBy: { topUpDate: 'asc' } },
+        packet: true,
+      },
+    });
+    if (!transaction) throw new NotFoundException('Girvi transaction not found');
+    return transaction;
+  }
+
+  async list(ctx: RequestContext, status?: string, page = 1, pageSize = 25) {
+    const where = { tenantId: ctx.tenantId, ...(status ? { status: status as any } : {}) };
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.girviTransaction.findMany({
+        where,
+        include: { valuation: true, customer: true },
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.girviTransaction.count({ where }),
+    ]);
+    return { results: rows, total, page, pageSize };
+  }
+}
