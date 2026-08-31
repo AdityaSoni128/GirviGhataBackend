@@ -13,7 +13,7 @@ export class CryptoService {
   private readonly key: Buffer;
 
   constructor() {
-    const raw = process.env.KYC_ENCRYPTION_KEY || 'insecure-dev-key-change-me-32b!';
+    const raw = process.env.KYC_ENCRYPTION_KEY!;
     // Derive a proper 32-byte key regardless of the raw secret's length.
     this.key = createHash('sha256').update(raw).digest();
   }

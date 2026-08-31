@@ -3,6 +3,25 @@ import * as argon2 from 'argon2';
 
 const prisma = new PrismaClient();
 
+
+function getSeedOwnerPassword(): string {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'seed.ts must not be run in production. Create the first tenant/owner through the production onboarding flow instead.',
+    );
+  }
+
+  const password = process.env.SEED_OWNER_PASSWORD;
+
+  if (!password) {
+    throw new Error(
+      'SEED_OWNER_PASSWORD is required when running seed.ts outside production.',
+    );
+  }
+
+  return password;
+}
+
 // Canonical permission list (Section 40). Kept as data, not enums, so a
 // Super Admin can extend this list without a code deploy.
 const PERMISSIONS: Array<{ code: string; description: string }> = [
@@ -159,7 +178,7 @@ async function main() {
     });
   }
 
-   const silverPurities: Array<[string, string]> = [
+  const silverPurities: Array<[string, string]> = [
     ['999', '0.9990'], ['925', '0.9250'], ['900', '0.9000'], ['835', '0.8350'],
     ['70', '0.7000'], ['65', '0.6500'], ['60', '0.6000'],
     ['50', '0.5000'], ['40', '0.4000'], ['35', '0.3500'],
@@ -211,8 +230,8 @@ async function main() {
   const ownerRole = await prisma.role.findUniqueOrThrow({
     where: { tenantId_name: { tenantId: tenant.id, name: 'Business Owner' } },
   });
-  const passwordHash = await argon2.hash('Msdhoni0707@');
-  const owner = await prisma.user.upsert({
+  const seedOwnerPassword = getSeedOwnerPassword();
+  const passwordHash = await argon2.hash(seedOwnerPassword); const owner = await prisma.user.upsert({
     where: { tenantId_email: { tenantId: tenant.id, email: 'owner@shreeramjwellers.example' } },
     update: {},
     create: {
@@ -234,7 +253,9 @@ async function main() {
   });
 
   // eslint-disable-next-line no-console
-  console.log('Seed complete. Demo login: owner@shreeramjwellers.example / ChangeMe123! (change immediately)');
+  console.log(
+  'Seed complete. Initial owner user created/verified. Password is supplied through SEED_OWNER_PASSWORD and is not logged.',
+);
 }
 
 main()
