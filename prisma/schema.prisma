@@ -219,7 +219,7 @@ model Customer {
   customerCode String // e.g. CUS-000001, per numbering rules
   fullName     String
   guardianName String? // father's/husband's name
-  mobile       String
+  mobile       String?
   altMobile    String?
   dob          DateTime?
   addressLine1 String?

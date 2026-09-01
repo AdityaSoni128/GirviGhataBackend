@@ -8,9 +8,10 @@ export class CreateCustomerDto {
   @IsString()
   guardianName?: string;
 
+  @IsOptional()
   @IsString()
   @Length(10, 15)
-  mobile!: string;
+  mobile?: string;
 
   @IsOptional()
   @IsString()
