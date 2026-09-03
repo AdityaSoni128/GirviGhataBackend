@@ -54,7 +54,7 @@ import { UploadsModule } from './modules/uploads/uploads.module';
     UploadsModule,
   ],
   providers: [
-    // { provide: APP_GUARD, useClass: ThrottlerGuard },
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_GUARD, useClass: JwtAuthGuard }, // must run before PermissionsGuard: populates request.context
     { provide: APP_GUARD, useClass: PermissionsGuard },
     { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
