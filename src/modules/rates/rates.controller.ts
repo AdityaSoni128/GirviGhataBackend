@@ -14,6 +14,18 @@ export class RatesController {
     return this.ratesService.getCurrent(ctx, metalCode);
   }
 
+  /**
+   * Whether today's (IST) rates have been set for every metal this tenant
+   * has configured. No @RequirePermissions — any authenticated user can
+   * check this (it drives a login-time popup), but only users with
+   * rate:change can actually act on it; the frontend gates the popup on
+   * that permission.
+   */
+  @Get('status')
+  getStatus(@CurrentContext() ctx: RequestContext) {
+    return this.ratesService.getStatus(ctx);
+  }
+
   @Post()
   @RequirePermissions('rate:change')
   setRate(@CurrentContext() ctx: RequestContext, @Body() dto: SetRateDto) {

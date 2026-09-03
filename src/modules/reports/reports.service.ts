@@ -14,10 +14,14 @@ export class ReportsService {
 
   /**
    * Dashboard summary cards (Section 26/27). Principal/interest outstanding
-   * are computed live via OutstandingService for every ACTIVE/PARTIALLY_PAID/
-   * OVERDUE transaction — fine at moderate scale; at high transaction volume
-   * (Section 70, 100k+ transactions) this should move to a scheduled job that
-   * writes daily interest_accruals rows instead of recomputing on request.
+   * are computed live via OutstandingService.getOutstandingBulk() for every
+   * ACTIVE/PARTIALLY_PAID/OVERDUE/RENEWED transaction in ONE batch — not
+   * one getOutstanding() DB round trip per transaction (see
+   * OutstandingService.getOutstandingBulk for why/how). At high
+   * transaction volume (Section 70, 100k+ transactions) this should move
+   * to a scheduled job that writes daily interest_accruals rows instead of
+   * recomputing on request — the bulk fetch below keeps it fast at
+   * moderate scale but is still O(open transactions) in memory/CPU.
    */
   async dashboardSummary(ctx: RequestContext) {
     const openTransactions = await this.prisma.girviTransaction.findMany({
@@ -27,6 +31,11 @@ export class ReportsService {
       },
       include: { items: true, valuation: true },
     });
+
+    const breakdownByTxId = await this.outstanding.getOutstandingBulk(
+      ctx.tenantId,
+      openTransactions.map((tx: { id: string }) => tx.id),
+    );
 
     let principalOutstanding = new Decimal(0);
     let interestOutstanding = new Decimal(0);
@@ -39,7 +48,11 @@ export class ReportsService {
     const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
 
     for (const tx of openTransactions) {
-      const breakdown = await this.outstanding.getOutstanding(ctx.tenantId, tx.id);
+      // getOutstandingBulk() is fetched from the SAME tenant-scoped
+      // openTransactions list, so every id is guaranteed present unless
+      // computeBreakdown() threw (which would already have aborted the
+      // whole request, same as the old per-transaction loop did).
+      const breakdown = breakdownByTxId.get(tx.id)!;
       principalOutstanding = principalOutstanding.plus(breakdown.principal);
       interestOutstanding = interestOutstanding.plus(breakdown.interestAccrued);
 
