@@ -2,7 +2,7 @@ import { Injectable, NotFoundException, BadRequestException } from '@nestjs/comm
 import { Decimal } from 'decimal.js';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { RequestContext } from '../../common/decorators/current-context.decorator';
-import { OutstandingService } from '../payments/outstanding.service';
+import { OutstandingService, TRANSACTION_INCLUDE } from '../payments/outstanding.service';
 import { RecordDailyClosingDto } from './dto/record-daily-closing.dto';
 
 @Injectable()
@@ -14,27 +14,33 @@ export class ReportsService {
 
   /**
    * Dashboard summary cards (Section 26/27). Principal/interest outstanding
-   * are computed live via OutstandingService.getOutstandingBulk() for every
-   * ACTIVE/PARTIALLY_PAID/OVERDUE/RENEWED transaction in ONE batch — not
-   * one getOutstanding() DB round trip per transaction (see
-   * OutstandingService.getOutstandingBulk for why/how). At high
-   * transaction volume (Section 70, 100k+ transactions) this should move
-   * to a scheduled job that writes daily interest_accruals rows instead of
-   * recomputing on request — the bulk fetch below keeps it fast at
-   * moderate scale but is still O(open transactions) in memory/CPU.
+   * are computed live via OutstandingService.computeOutstandingForPreloaded()
+   * for every ACTIVE/PARTIALLY_PAID/OVERDUE/RENEWED transaction in ONE
+   * batch — not one getOutstanding() DB round trip per transaction, and not
+   * even a second findMany() for the same rows (that method reuses the
+   * transactions this function already fetched — see its doc comment). At
+   * high transaction volume (Section 70, 100k+ transactions) this should
+   * move to a scheduled job that writes daily interest_accruals rows
+   * instead of recomputing on request — the bulk fetch below keeps it fast
+   * at moderate scale but is still O(open transactions) in memory/CPU.
    */
   async dashboardSummary(ctx: RequestContext) {
+    // Fetched ONCE with the same TRANSACTION_INCLUDE shape OutstandingService
+    // uses internally, then handed straight to computeOutstandingForPreloaded()
+    // below — this used to be two separate findMany() calls for the exact
+    // same set of transactions (one here, one inside getOutstandingBulk()),
+    // which was the single largest contributor to dashboard latency.
     const openTransactions = await this.prisma.girviTransaction.findMany({
       where: {
         tenantId: ctx.tenantId,
         status: { in: ['ACTIVE', 'PARTIALLY_PAID', 'OVERDUE', 'RENEWED'] },
       },
-      include: { items: true, valuation: true },
+      include: TRANSACTION_INCLUDE,
     });
 
-    const breakdownByTxId = await this.outstanding.getOutstandingBulk(
+    const breakdownByTxId = await this.outstanding.computeOutstandingForPreloaded(
       ctx.tenantId,
-      openTransactions.map((tx: { id: string }) => tx.id),
+      openTransactions,
     );
 
     let principalOutstanding = new Decimal(0);
@@ -69,18 +75,23 @@ export class ReportsService {
 
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
-    const todaysCollections = await this.prisma.payment.aggregate({
-      where: { tenantId: ctx.tenantId, isReversed: false, paymentDate: { gte: startOfToday } },
-      _sum: { amount: true },
-    });
 
     const startOfMonth = new Date();
     startOfMonth.setDate(1);
     startOfMonth.setHours(0, 0, 0, 0);
-    const monthCollections = await this.prisma.payment.aggregate({
-      where: { tenantId: ctx.tenantId, isReversed: false, paymentDate: { gte: startOfMonth } },
-      _sum: { amount: true },
-    });
+
+    // Independent aggregate queries — run concurrently instead of one
+    // sequential round trip after the other.
+    const [todaysCollections, monthCollections] = await Promise.all([
+      this.prisma.payment.aggregate({
+        where: { tenantId: ctx.tenantId, isReversed: false, paymentDate: { gte: startOfToday } },
+        _sum: { amount: true },
+      }),
+      this.prisma.payment.aggregate({
+        where: { tenantId: ctx.tenantId, isReversed: false, paymentDate: { gte: startOfMonth } },
+        _sum: { amount: true },
+      }),
+    ]);
 
     return {
       activeGirviCount: openTransactions.length,

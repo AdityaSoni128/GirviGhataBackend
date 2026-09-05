@@ -7,8 +7,12 @@ import { BusinessRules, OutstandingBreakdown } from '../calculation-engine/calcu
 
 // Exactly the includes getOutstanding() has always used — pulled out to a
 // const so the bulk path below fetches the identical shape of data in one
-// findMany() instead of N findFirst() calls.
-const TRANSACTION_INCLUDE = {
+// findMany() instead of N findFirst() calls. Exported so callers that
+// already need this same shape for other purposes (e.g. the dashboard,
+// which also reads `items` for gold/silver weight totals) can fetch it
+// ONCE and hand the rows to computeOutstandingForPreloaded() below instead
+// of this module querying the same transactions a second time.
+export const TRANSACTION_INCLUDE = {
   valuation: true,
   payments: { where: { isReversed: false }, include: { allocations: true } },
   items: true,
@@ -20,7 +24,7 @@ const TRANSACTION_INCLUDE = {
 // pure calculation function decoupled from the ORM's generated type surface
 // and matches whatever findFirst()/findMany() with TRANSACTION_INCLUDE
 // actually returns structurally.
-interface TransactionForOutstanding {
+export interface TransactionForOutstanding {
   id: string;
   pledgeDate: Date;
   valuation: { actualLoanAmount: { toString(): string }; interestPercent: { toString(): string } } | null;
@@ -134,16 +138,40 @@ export class OutstandingService {
       include: TRANSACTION_INCLUDE,
     });
 
+    return this.computeOutstandingForPreloaded(tenantId, transactions);
+  }
+
+  /**
+   * Same computation as getOutstandingBulk(), but for transactions the
+   * caller has ALREADY fetched (with the TRANSACTION_INCLUDE shape) —
+   * skips the findMany() entirely. Exists so callers that need the same
+   * rows for another purpose too (e.g. ReportsService.dashboardSummary(),
+   * which also reads `items` for gold/silver weight totals) fetch the
+   * transaction list exactly once instead of once here and once there.
+   *
+   * Also parallelizes the per-distinct-metal rules lookups (was a
+   * sequential `for...await` loop) via Promise.all — independent reads,
+   * no reason to pay N network round trips serially.
+   */
+  async computeOutstandingForPreloaded(
+    tenantId: string,
+    transactions: TransactionForOutstanding[],
+  ): Promise<Map<string, OutstandingBreakdown>> {
+    if (transactions.length === 0) return new Map();
+
     // Fetch each distinct metal's active rules exactly once and reuse it
     // for every transaction on that metal — this is what collapses N
-    // rules queries down to (number of distinct metals) queries.
+    // rules queries down to (number of distinct metals) queries, run
+    // concurrently since each metal's rules are independent of the others.
     const metalCodes: string[] = Array.from(
-      new Set(transactions.map((tx: TransactionForOutstanding) => tx.items[0]?.metalCode ?? 'GOLD')),
+      new Set(transactions.map((tx) => tx.items[0]?.metalCode ?? 'GOLD')),
     );
-    const rulesByMetal = new Map<string, BusinessRules>();
-    for (const metalCode of metalCodes) {
-      rulesByMetal.set(metalCode, await this.rules.getActiveRules(tenantId, metalCode));
-    }
+    const rulesEntries = await Promise.all(
+      metalCodes.map(
+        async (metalCode) => [metalCode, await this.rules.getActiveRules(tenantId, metalCode)] as const,
+      ),
+    );
+    const rulesByMetal = new Map<string, BusinessRules>(rulesEntries);
 
     const now = new Date();
     const results = new Map<string, OutstandingBreakdown>();

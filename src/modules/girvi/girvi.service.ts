@@ -7,7 +7,14 @@ import { CalculationEngineService } from '../calculation-engine/calculation-engi
 import { RulesService } from '../rules/rules.service';
 import { CreateGirviDto } from './dto/create-girvi.dto';
 import { CreateTopUpDto } from './dto/create-topup.dto';
+import { ListGirviDto } from './dto/list-girvi.dto';
 import { ItemMeasurement, RateSnapshot } from '../calculation-engine/calculation.types';
+import { parsePagination, resolveSortField, resolveSortOrder } from '../../common/pagination/pagination.util';
+
+/** Allowlisted sort fields for GET /girvi — never pass sortBy straight into
+ * Prisma `orderBy`. */
+const GIRVI_SORT_FIELDS = ['createdAt', 'pledgeDate', 'dueDate'] as const;
+type GirviSortField = (typeof GIRVI_SORT_FIELDS)[number];
 
 @Injectable()
 export class GirviService {
@@ -465,18 +472,73 @@ export class GirviService {
     return transaction;
   }
 
-  async list(ctx: RequestContext, status?: string, page = 1, pageSize = 25) {
-    const where = { tenantId: ctx.tenantId, ...(status ? { status: status as any } : {}) };
+  /**
+   * Server-side search + filter + sort + pagination, all applied in a
+   * single Postgres query via Prisma. `search` matches against the FULL
+   * dataset (girviNumber, customer name, customer mobile) — never just the
+   * rows on the current page. `total` reflects the count of rows matching
+   * the current search/filters, not the whole table.
+   *
+   * The list only selects the fields the Girvi list screen actually
+   * displays (girviNumber, status, loan amount, customer name) rather than
+   * the full transaction graph (items/payments/topUps/etc.) that
+   * findOne() returns — keeping list-page payloads small regardless of how
+   * many items/payments a given Girvi has accumulated.
+   */
+  async list(ctx: RequestContext, query: ListGirviDto) {
+    const { status, search, fromDate, toDate } = query;
+
+    const dateFilter: Record<string, Date> = {};
+    if (fromDate) {
+      const d = new Date(fromDate);
+      if (!Number.isNaN(d.getTime())) dateFilter.gte = d;
+    }
+    if (toDate) {
+      const d = new Date(toDate);
+      if (!Number.isNaN(d.getTime())) dateFilter.lte = d;
+    }
+
+    const where = {
+      tenantId: ctx.tenantId,
+      ...(status ? { status: status as any } : {}),
+      ...(Object.keys(dateFilter).length ? { pledgeDate: dateFilter } : {}),
+      ...(search
+        ? {
+          OR: [
+            { girviNumber: { contains: search, mode: 'insensitive' as const } },
+            { customer: { fullName: { contains: search, mode: 'insensitive' as const } } },
+            { customer: { mobile: { contains: search } } },
+          ],
+        }
+        : {}),
+    };
+
+    const { page, pageSize, skip, take } = parsePagination(query.page, query.pageSize, 25);
+    const field = resolveSortField<GirviSortField>(query.sortBy, GIRVI_SORT_FIELDS, 'createdAt');
+    const order = resolveSortOrder(query.sortOrder);
+
     const [rows, total] = await this.prisma.$transaction([
       this.prisma.girviTransaction.findMany({
         where,
-        include: { valuation: true, customer: true },
-        orderBy: { createdAt: 'desc' },
-        skip: (page - 1) * pageSize,
-        take: pageSize,
+        select: {
+          id: true,
+          girviNumber: true,
+          status: true,
+          pledgeDate: true,
+          dueDate: true,
+          createdAt: true,
+          customer: { select: { id: true, fullName: true, mobile: true, customerCode: true } },
+          valuation: { select: { actualLoanAmount: true } },
+        },
+        // `id` as a secondary sort key keeps pagination deterministic when
+        // many rows share the same primary sort value.
+        orderBy: [{ [field]: order }, { id: 'desc' }],
+        skip,
+        take,
       }),
       this.prisma.girviTransaction.count({ where }),
     ]);
+
     return { results: rows, total, page, pageSize };
   }
 }

@@ -370,6 +370,11 @@ model BusinessRuleSet {
   tenant Tenant @relation(fields: [tenantId], references: [id])
 
   @@unique([tenantId, metalCode, version])
+  // getActiveRules() (called on every pledge, top-up, and outstanding-
+  // balance calculation) filters by tenantId + metalCode + isActive. The
+  // unique index above covers (tenantId, metalCode) as a prefix but not
+  // isActive, so add it explicitly.
+  @@index([tenantId, metalCode, isActive])
   @@map("business_rule_sets")
 }
 
@@ -414,6 +419,10 @@ model GirviTransaction {
   @@unique([tenantId, girviNumber])
   @@index([tenantId, status])
   @@index([tenantId, customerId])
+  // Default list sort (createdAt desc) and cursor/offset pagination over
+  // it — without this, sorting the whole tenant's Girvi table by createdAt
+  // requires a full-table sort.
+  @@index([tenantId, createdAt])
   @@map("girvi_transactions")
 }
 
@@ -483,6 +492,11 @@ model PledgedItem {
   girviTransaction GirviTransaction @relation(fields: [girviTransactionId], references: [id])
   photos           ItemPhoto[]
 
+  // Postgres does not auto-index foreign key columns — every Girvi detail
+  // load and every outstanding-balance calculation joins to this table by
+  // girviTransactionId, so without this index each of those does a full
+  // table scan.
+  @@index([girviTransactionId])
   @@map("pledged_items")
 }
 
@@ -569,6 +583,12 @@ model Payment {
   ledgerEntries    CashLedgerEntry[]
 
   @@unique([tenantId, receiptNumber])
+  // Postgres does not auto-index foreign key columns — outstanding-balance
+  // calculations join to this table by girviTransactionId for every open
+  // Girvi, and the dashboard's today's/this-month's collections aggregates
+  // filter by tenantId + paymentDate.
+  @@index([tenantId, girviTransactionId])
+  @@index([tenantId, paymentDate])
   @@map("payments")
 }
 

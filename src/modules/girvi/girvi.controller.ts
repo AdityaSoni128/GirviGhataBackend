@@ -2,6 +2,7 @@ import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { GirviService } from './girvi.service';
 import { CreateGirviDto } from './dto/create-girvi.dto';
 import { CreateTopUpDto } from './dto/create-topup.dto';
+import { ListGirviDto } from './dto/list-girvi.dto';
 import { CurrentContext, RequestContext } from '../../common/decorators/current-context.decorator';
 import { RequirePermissions } from '../../common/decorators/require-permissions.decorator';
 
@@ -17,18 +18,8 @@ export class GirviController {
 
   @Get()
   @RequirePermissions('girvi:create')
-  list(
-    @CurrentContext() ctx: RequestContext,
-    @Query('status') status?: string,
-    @Query('page') page?: string,
-    @Query('pageSize') pageSize?: string,
-  ) {
-    return this.girviService.list(
-      ctx,
-      status,
-      page ? parseInt(page, 10) : undefined,
-      pageSize ? parseInt(pageSize, 10) : undefined,
-    );
+  list(@CurrentContext() ctx: RequestContext, @Query() query: ListGirviDto) {
+    return this.girviService.list(ctx, query);
   }
 
   @Get(':id')

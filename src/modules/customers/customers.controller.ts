@@ -19,9 +19,14 @@ export class CustomersController {
   @Get()
   @RequirePermissions('customer:view')
   search(@CurrentContext() ctx: RequestContext, @Query() query: SearchCustomersDto) {
-    const page = query.page ? parseInt(query.page, 10) : 1;
-    const pageSize = query.pageSize ? parseInt(query.pageSize, 10) : 25;
-    return this.customersService.search(ctx, query.q, page, pageSize);
+    return this.customersService.search(
+      ctx,
+      query.q,
+      query.page,
+      query.pageSize,
+      query.sortBy,
+      query.sortOrder,
+    );
   }
 
   @Get(':id')

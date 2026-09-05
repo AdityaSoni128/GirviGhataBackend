@@ -5,6 +5,12 @@ import { NumberSequenceService } from '../../common/numbering/number-sequence.se
 import { RequestContext } from '../../common/decorators/current-context.decorator';
 import { CreateCustomerDto } from './dto/create-customer.dto';
 import { UpdateCustomerDto } from './dto/update-customer.dto';
+import { parsePagination, resolveSortField, resolveSortOrder } from '../../common/pagination/pagination.util';
+
+/** Allowlisted sort fields for GET /customers — never pass sortBy straight
+ * into Prisma `orderBy`. */
+const CUSTOMER_SORT_FIELDS = ['createdAt', 'fullName', 'customerCode'] as const;
+type CustomerSortField = (typeof CUSTOMER_SORT_FIELDS)[number];
 
 @Injectable()
 export class CustomersService {
@@ -96,10 +102,26 @@ export class CustomersService {
     return this.findOne(ctx, customerId);
   }
 
-  /** Fast multi-field search (Section 7). Aadhaar/PAN are matched on their
-   * stored plaintext lookup fields (last-4 / full PAN), never by decrypting
-   * every row — that would be both slow and a KYC-exposure risk. */
-  async search(ctx: RequestContext, q: string | undefined, page: number, pageSize: number) {
+  /**
+   * Fast multi-field search (Section 7), fully server-side: filtering,
+   * sorting, and pagination all happen in the same Postgres query via
+   * Prisma `where`/`orderBy`/`skip`/`take` — this never fetches more than
+   * one page's worth of rows, regardless of how many customers the tenant
+   * has. `total` is the count of rows matching the current search (via
+   * `count(where)` in the same transaction), not the whole table.
+   *
+   * Aadhaar/PAN are matched on their stored plaintext lookup fields
+   * (last-4 / full PAN), never by decrypting every row — that would be
+   * both slow and a KYC-exposure risk.
+   */
+  async search(
+    ctx: RequestContext,
+    q: string | undefined,
+    page?: string,
+    pageSize?: string,
+    sortBy?: string,
+    sortOrder?: string,
+  ) {
     const where = {
       tenantId: ctx.tenantId,
       deletedAt: null,
@@ -116,13 +138,20 @@ export class CustomersService {
         : {}),
     };
 
+    const { page: safePage, pageSize: safePageSize, skip, take } = parsePagination(page, pageSize, 25);
+    const field = resolveSortField<CustomerSortField>(sortBy, CUSTOMER_SORT_FIELDS, 'createdAt');
+    const order = resolveSortOrder(sortOrder);
+
     const [rows, total] = await this.prisma.$transaction([
       this.prisma.customer.findMany({
         where,
         include: { kyc: true },
-        orderBy: { createdAt: 'desc' },
-        skip: (page - 1) * pageSize,
-        take: pageSize,
+        // `id` as a secondary sort key keeps pagination deterministic when
+        // many rows share the same primary sort value (e.g. same createdAt
+        // second, or same fullName).
+        orderBy: [{ [field]: order }, { id: 'desc' }],
+        skip,
+        take,
       }),
       this.prisma.customer.count({ where }),
     ]);
@@ -130,8 +159,8 @@ export class CustomersService {
     return {
       results: rows.map((c: any) => this.toSafeCustomer(c, c.kyc)),
       total,
-      page,
-      pageSize,
+      page: safePage,
+      pageSize: safePageSize,
     };
   }
 
