@@ -185,22 +185,44 @@ export class CustomersService {
 
     const transactions = await this.prisma.girviTransaction.findMany({
       where: { tenantId: ctx.tenantId, customerId },
-      include: { valuation: true, payments: true },
+      include: { valuation: true, payments: true, topUps: { select: { amount: true } }, },
       orderBy: { createdAt: 'desc' },
     });
 
     return {
-      ...this.toSafeCustomer(customer, (customer as any).kyc, viewFullKyc),
-      transactions: transactions.map((t: any) => ({
-        girviNumber: t.girviNumber,
-        status: t.status,
-        pledgeDate: t.pledgeDate,
-        dueDate: t.dueDate,
-        loanAmount: t.valuation?.actualLoanAmount ?? null,
-        totalPaid: t.payments
-          .filter((p: any) => !p.isReversed)
-          .reduce((sum: number, p: any) => sum + Number(p.amount), 0),
-      })),
+      ...this.toSafeCustomer(
+        customer,
+        (customer as any).kyc,
+        viewFullKyc,
+      ),
+
+      transactions: transactions.map((t: any) => {
+        const originalLoanAmount = t.valuation?.actualLoanAmount
+          ? Number(t.valuation.actualLoanAmount)
+          : 0;
+
+        const totalTopUpAmount = t.topUps.reduce(
+          (sum: number, topUp: any) => sum + Number(topUp.amount),
+          0,
+        );
+
+        const totalLoanAmount =
+          originalLoanAmount + totalTopUpAmount;
+
+        return {
+          girviNumber: t.girviNumber,
+          status: t.status,
+          pledgeDate: t.pledgeDate,
+          dueDate: t.dueDate,
+          loanAmount: totalLoanAmount,
+          totalPaid: t.payments
+            .filter((p: any) => !p.isReversed)
+            .reduce(
+              (sum: number, p: any) => sum + Number(p.amount),
+              0,
+            ),
+        };
+      }),
     };
   }
 

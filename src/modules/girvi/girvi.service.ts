@@ -129,7 +129,7 @@ export class GirviService {
     if (requestedLoanAmount.greaterThan(combinedMaxLoan)) {
       throw new BadRequestException(
         `Requested loan ₹${requestedLoanAmount.toString()} exceeds the maximum eligible amount ` +
-          `₹${combinedMaxLoan.toString()} calculated from current rates and rules.`,
+        `₹${combinedMaxLoan.toString()} calculated from current rates and rules.`,
       );
     }
     if (requestedLoanAmount.lessThanOrEqualTo(0)) {
@@ -299,8 +299,8 @@ export class GirviService {
     if (newTotalPrincipal.greaterThan(currentValuation.currentMaxLoanAmount)) {
       throw new BadRequestException(
         `Top-up of ₹${amount.toString()} would bring total principal to ₹${newTotalPrincipal.toString()}, ` +
-          `exceeding the CURRENT maximum eligible amount of ₹${currentValuation.currentMaxLoanAmount.toString()} ` +
-          `(recalculated at today's rate).`,
+        `exceeding the CURRENT maximum eligible amount of ₹${currentValuation.currentMaxLoanAmount.toString()} ` +
+        `(recalculated at today's rate).`,
       );
     }
 
@@ -529,6 +529,7 @@ export class GirviService {
           createdAt: true,
           customer: { select: { id: true, fullName: true, mobile: true, customerCode: true } },
           valuation: { select: { actualLoanAmount: true } },
+          topUps: { select: { amount: true } }
         },
         // `id` as a secondary sort key keeps pagination deterministic when
         // many rows share the same primary sort value.
@@ -538,7 +539,26 @@ export class GirviService {
       }),
       this.prisma.girviTransaction.count({ where }),
     ]);
+    const results = rows.map((row) => {
+      const originalLoanAmount = row.valuation?.actualLoanAmount
+        ? new Decimal(row.valuation.actualLoanAmount.toString())
+        : new Decimal(0);
 
-    return { results: rows, total, page, pageSize };
+      const totalTopUpAmount = row.topUps.reduce(
+        (sum, topUp) => sum.plus(topUp.amount.toString()),
+        new Decimal(0),
+      );
+
+      return {
+        ...row,
+        loanAmount: originalLoanAmount.plus(totalTopUpAmount).toString(),
+      };
+    });
+    return {
+      results,
+      total,
+      page,
+      pageSize,
+    };
   }
 }
