@@ -562,6 +562,7 @@ model Payment {
   girviTransactionId String
   receiptNumber      String // PAY-2026-000001
   amount             Decimal  @db.Decimal(14, 2)
+  discountAmount Decimal @default(0) @db.Decimal(14, 2)
   mode               String // "CASH" | "UPI" | "BANK" | "OTHER"
   referenceNumber    String?
   // The actual date the payment was physically received — may be

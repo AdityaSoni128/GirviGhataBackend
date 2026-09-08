@@ -7,6 +7,10 @@ export class CreatePaymentDto {
   @IsNumberString()
   amount!: string;
 
+  @IsOptional()
+  @IsNumberString()
+  discountAmount?: string;
+
   @IsIn(['CASH', 'UPI', 'BANK', 'OTHER'])
   mode!: 'CASH' | 'UPI' | 'BANK' | 'OTHER';
 

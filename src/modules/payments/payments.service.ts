@@ -44,6 +44,11 @@ export class PaymentsService {
       throw new BadRequestException('Payment amount must be greater than zero');
     }
 
+    const discountAmount = new Decimal(dto.discountAmount ?? '0');
+    if (discountAmount.isNegative()) {
+      throw new BadRequestException('Discount amount cannot be negative');
+    }
+
     const transaction = await this.prisma.girviTransaction.findFirst({
       where: { id: dto.girviTransactionId, tenantId: ctx.tenantId },
       include: { items: true },
@@ -66,7 +71,20 @@ export class PaymentsService {
     }
 
     const outstandingBreakdown = await this.outstanding.getOutstanding(ctx.tenantId, transaction.id);
-    const totalOutstanding = this.engine.calculateOutstanding(outstandingBreakdown);
+
+    if (discountAmount.greaterThan(outstandingBreakdown.interestAccrued)) {
+      throw new BadRequestException(
+        `Discount ₹${discountAmount.toString()} cannot exceed outstanding interest ₹${outstandingBreakdown.interestAccrued.toString()}.`,
+      );
+    }
+
+    const adjustedOutstandingBreakdown = {
+      ...outstandingBreakdown,
+      interestAccrued: outstandingBreakdown.interestAccrued.minus(discountAmount),
+    };
+
+    const totalOutstanding = this.engine.calculateOutstanding(adjustedOutstandingBreakdown);
+
     if (amount.greaterThan(totalOutstanding)) {
       throw new BadRequestException(
         `Payment ₹${amount.toString()} exceeds total outstanding ₹${totalOutstanding.toString()}. ` +
@@ -76,7 +94,11 @@ export class PaymentsService {
 
     const metalCode = transaction.items[0]?.metalCode ?? 'GOLD';
     const rules = await this.rules.getActiveRules(ctx.tenantId, metalCode);
-    const allocation = this.engine.calculatePaymentAllocation(amount, outstandingBreakdown, rules);
+    const allocation = this.engine.calculatePaymentAllocation(
+      amount,
+      adjustedOutstandingBreakdown,
+      rules,
+    );
 
     return this.prisma.$transaction(async (tx) => {
       const receiptNumber = await this.sequences.next(tx, ctx.tenantId, 'PAYMENT');
@@ -87,6 +109,7 @@ export class PaymentsService {
           girviTransactionId: transaction.id,
           receiptNumber,
           amount: amount.toString(),
+          discountAmount: discountAmount.toString(),
           mode: dto.mode,
           referenceNumber: dto.referenceNumber,
           paymentDate,
@@ -137,6 +160,7 @@ export class PaymentsService {
           newValue: {
             receiptNumber,
             amount: amount.toString(),
+            discountAmount: discountAmount.toString(),
             paymentDate: paymentDate.toISOString(),
             backdated: dto.paymentDate ? paymentDate.toDateString() !== now.toDateString() : false,
             allocation: {
