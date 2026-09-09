@@ -75,7 +75,7 @@ export class GirviService {
         orderBy: { effectiveFrom: 'desc' },
       });
       if (!currentRate) throw new BadRequestException(`No current rate set for ${metalCode}`);
-
+      
       rates[metalCode] = {
         metalCode,
         ratePerGram: new Decimal(currentRate.ratePerGram.toString()),
@@ -490,11 +490,11 @@ export class GirviService {
 
     const dateFilter: Record<string, Date> = {};
     if (fromDate) {
-      const d = new Date(fromDate);
+      const d = new Date(`${fromDate}T00:00:00`);
       if (!Number.isNaN(d.getTime())) dateFilter.gte = d;
     }
     if (toDate) {
-      const d = new Date(toDate);
+      const d = new Date(`${toDate}T23:59:59.999`);
       if (!Number.isNaN(d.getTime())) dateFilter.lte = d;
     }
 
