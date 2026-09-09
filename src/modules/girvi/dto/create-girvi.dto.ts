@@ -85,4 +85,8 @@ export class CreateGirviDto {
   @IsOptional()
   @IsNumberString()
   interestPercent?: string;
+
+  @IsOptional()
+  @IsNumberString()
+  eligibilityPercent?: string;
 }

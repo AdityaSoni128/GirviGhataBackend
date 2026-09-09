@@ -103,6 +103,29 @@ export class GirviService {
       });
     }
 
+    const primaryRuleMetal = metalCodes.includes('GOLD') ? 'GOLD' : metalCodes[0];
+    const primaryRules = ruleSets[primaryRuleMetal];
+
+    let appliedEligibilityPercent: Decimal;
+
+    if (dto.eligibilityPercent !== undefined) {
+      appliedEligibilityPercent = new Decimal(dto.eligibilityPercent);
+
+      if (appliedEligibilityPercent.isNegative()) {
+        throw new BadRequestException(
+          'Eligibility percentage cannot be negative',
+        );
+      }
+
+      if (appliedEligibilityPercent.greaterThan(100)) {
+        throw new BadRequestException(
+          'Eligibility percentage cannot exceed 100%',
+        );
+      }
+    } else {
+      appliedEligibilityPercent = primaryRules.eligibilityPercent;
+    }
+
     let combinedMaxLoan = new Decimal(0);
     let combinedEligibleValue = new Decimal(0);
     let combinedFineWeight = new Decimal(0);
@@ -116,6 +139,7 @@ export class GirviService {
         rates,
         ruleSets[metalCode],
         metalCode,
+        appliedEligibilityPercent,
       );
       combinedMaxLoan = combinedMaxLoan.plus(result.maxLoanAmount);
       combinedEligibleValue = combinedEligibleValue.plus(result.eligibleValue);
@@ -136,8 +160,6 @@ export class GirviService {
       throw new BadRequestException('Requested loan amount must be greater than zero');
     }
 
-    const primaryRuleMetal = metalCodes.includes('GOLD') ? 'GOLD' : metalCodes[0];
-    const primaryRules = ruleSets[primaryRuleMetal];
 
     // Lock in the interest rate for this specific transaction (Section 2
     // of the interest-rate-locking requirement). Defaults to the active
@@ -208,7 +230,7 @@ export class GirviService {
           metalRateId: rates[primaryRuleMetal].rateId,
           totalFineWeight: combinedFineWeight.toString(),
           totalMetalValue: combinedMetalValue.toString(),
-          eligibilityPercent: primaryRules.eligibilityPercent.toString(),
+          eligibilityPercent: appliedEligibilityPercent.toString(),
           eligibleValue: combinedEligibleValue.toString(),
           marginApplied: combinedMargin.toString(),
           maxLoanAmount: combinedMaxLoan.toString(),
@@ -248,6 +270,8 @@ export class GirviService {
             hasSignature: !!dto.customerSignatureUrl,
             interestPercent: lockedInterestPercent.toString(),
             interestRateOverridden: dto.interestPercent !== undefined,
+            eligibilityPercent: appliedEligibilityPercent.toString(),
+            eligibilityPercentOverridden: dto.eligibilityPercent !== undefined,
           },
         },
       });

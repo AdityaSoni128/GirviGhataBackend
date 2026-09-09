@@ -210,6 +210,7 @@ export class CustomersService {
           originalLoanAmount + totalTopUpAmount;
 
         return {
+          id: t.id ,
           girviNumber: t.girviNumber,
           status: t.status,
           pledgeDate: t.pledgeDate,

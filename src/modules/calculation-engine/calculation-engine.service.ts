@@ -58,6 +58,7 @@ export class CalculationEngineService {
     rates: Record<string, RateSnapshot>, // keyed by metalCode
     rules: BusinessRules,
     metalCode: string,
+    eligibilityPercentOverride?: Decimal,
   ): PledgeValuationResult {
     const rate = rates[metalCode];
     if (!rate) {
@@ -80,7 +81,8 @@ export class CalculationEngineService {
       new Decimal(0),
     );
 
-    const eligibleValue = this.calculateEligibleValue(totalMetalValue, rules.eligibilityPercent);
+    const appliedEligibilityPercent = eligibilityPercentOverride ?? rules.eligibilityPercent;
+    const eligibleValue = this.calculateEligibleValue(totalMetalValue, appliedEligibilityPercent);
     const marginApplied = this.resolveMargin(eligibleValue, rules);
     const maxLoanAmount = this.applyMargin(eligibleValue, marginApplied, rules);
 
@@ -88,7 +90,7 @@ export class CalculationEngineService {
       items: itemResults,
       totalFineWeight,
       totalMetalValue,
-      eligibilityPercent: rules.eligibilityPercent,
+      eligibilityPercent: appliedEligibilityPercent,
       eligibleValue,
       marginApplied,
       maxLoanAmount,
@@ -103,7 +105,7 @@ export class CalculationEngineService {
         })),
         totalFineWeight: totalFineWeight.toString(),
         totalMetalValue: totalMetalValue.toString(),
-        eligibilityPercent: rules.eligibilityPercent.toString(),
+        eligibilityPercent: appliedEligibilityPercent.toString(),
         eligibleValue: eligibleValue.toString(),
         marginType: rules.marginType,
         marginApplied: marginApplied.toString(),
