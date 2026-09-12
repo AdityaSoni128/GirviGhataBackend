@@ -449,7 +449,6 @@ model GirviTopUp {
   //          cycle starting from the top-up's month).
   // Enforced server-side in OutstandingService — never trusted from a
   // pre-computed frontend number.
-  applyPreviousInterestStartDate Boolean
   createdBy                      String
   createdAt                      DateTime @default(now())
 

@@ -34,7 +34,6 @@ export interface TransactionForOutstanding {
   items: Array<{ metalCode: string }>;
   topUps: Array<{
     amount: { toString(): string };
-    applyPreviousInterestStartDate: boolean;
     topUpDate: Date;
   }>;
 }
@@ -254,7 +253,7 @@ export class OutstandingService {
       { principal: principalOriginal, anchorDate: pledgeDate },
       ...transaction.topUps.map((t) => ({
         principal: new Decimal(t.amount.toString()),
-        anchorDate: t.applyPreviousInterestStartDate ? pledgeDate : t.topUpDate,
+        anchorDate: pledgeDate,
       })),
     ];
 

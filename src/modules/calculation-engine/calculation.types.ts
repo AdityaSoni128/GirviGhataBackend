@@ -36,8 +36,7 @@ export interface BusinessRules {
  * One interest-bearing slice of a loan's principal, with its own
  * calendar-month anchor date. The original pledge is tranche #1
  * (anchored to pledgeDate); each top-up is an additional tranche,
- * anchored either to pledgeDate (if applyPreviousInterestStartDate) or
- * to its own topUpDate. OutstandingService builds this list and sums
+ * anchored  pledgeDate. OutstandingService builds this list and sums
  * interest across tranches — CalculationEngineService itself stays
  * tranche-agnostic, just computing one tranche's interest per call via
  * the existing calculateInterest/calculateCalendarMonthsElapsed methods.

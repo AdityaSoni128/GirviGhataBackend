@@ -207,7 +207,7 @@ export class CalculationEngineService {
    * through the asOf month, inclusive.
    *
    * Examples:
-   *   pledge 12-Feb-2025, asOf 12-Feb-2025 -> 1
+   *   pledge 12-Feb-2025, asOf 12-Feb-2025 -> 0
    *   pledge 12-Feb-2025, asOf 28-Feb-2025 -> 1
    *   pledge 12-Feb-2025, asOf 01-Mar-2025 -> 2
    *   pledge 12-Feb-2025, asOf 31-Mar-2025 -> 2
@@ -226,10 +226,19 @@ export class CalculationEngineService {
         `asOfDate (${asOfDate.toISOString()}) cannot be earlier than pledgeDate (${pledgeDate.toISOString()})`,
       );
     }
+
     const monthDiff =
       (asOfDate.getFullYear() - pledgeDate.getFullYear()) * 12 +
       (asOfDate.getMonth() - pledgeDate.getMonth());
-    return monthDiff + 1; // inclusive: the pledge month itself always counts as 1 full month
+
+    // Same calendar day = 0 months.
+    // Even one day after the pledge date = 1 full month.
+    const isSameCalendarDay =
+      asOfDate.getFullYear() === pledgeDate.getFullYear() &&
+      asOfDate.getMonth() === pledgeDate.getMonth() &&
+      asOfDate.getDate() === pledgeDate.getDate();
+
+    return isSameCalendarDay ? 0 : monthDiff + 1;
   }
 
   // --- Outstanding & payments ---------------------------------------------

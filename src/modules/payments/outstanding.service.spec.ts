@@ -39,7 +39,7 @@ function makeTransaction(opts: {
   pledgeDate: Date;
   actualLoanAmount: number;
   lockedInterestPercent: number;
-  topUps?: Array<{ amount: number; applyPreviousInterestStartDate: boolean; topUpDate: Date }>;
+  topUps?: Array<{ amount: number; topUpDate: Date }>;
   payments?: Array<{ isReversed: boolean; allocations: Array<{ category: string; amount: number }> }>;
 }) {
   return {
@@ -53,7 +53,6 @@ function makeTransaction(opts: {
     items: [{ metalCode: opts.metalCode }],
     topUps: (opts.topUps ?? []).map((t) => ({
       amount: d(t.amount),
-      applyPreviousInterestStartDate: t.applyPreviousInterestStartDate,
       topUpDate: t.topUpDate,
     })),
     // getOutstanding()/getOutstandingBulk() both query payments already
@@ -246,7 +245,7 @@ describe('OutstandingService', () => {
       expect(result.interestAccrued.toString()).toBe('0');
     });
 
-    it('multiple top-ups: applyPreviousInterestStartDate=true anchors to pledgeDate, false anchors to topUpDate', async () => {
+    it('multiple top-ups: every top-up uses the original pledgeDate for interest calculation', async () => {
       const tx = makeTransaction({
         id: 'tx-7',
         tenantId: TENANT_A,
@@ -255,20 +254,22 @@ describe('OutstandingService', () => {
         actualLoanAmount: 10000,
         lockedInterestPercent: 1,
         topUps: [
-          // anchored to pledgeDate (Jan 15) -> Jan..Apr = 4 months
-          { amount: 1000, applyPreviousInterestStartDate: true, topUpDate: new Date('2026-03-01T00:00:00.000Z') },
-          // anchored to its own topUpDate (Apr 1) -> Apr only = 1 month
-          { amount: 2000, applyPreviousInterestStartDate: false, topUpDate: new Date('2026-04-01T00:00:00.000Z') },
+          { amount: 1000, topUpDate: new Date('2026-03-01T00:00:00.000Z') },
+          { amount: 2000, topUpDate: new Date('2026-04-01T00:00:00.000Z') },
         ],
       });
+
       prisma.girviTransaction.findFirst.mockResolvedValue(tx);
       rules.getActiveRules.mockResolvedValue(goldRules);
 
       const result = await service.getOutstanding(TENANT_A, 'tx-7');
-      // principal: 10000 orig * 1% * 4mo = 400
-      // top-up 1 (pledge-anchored): 1000 * 1% * 4mo = 40
-      // top-up 2 (topUpDate-anchored): 2000 * 1% * 1mo = 20
-      expect(result.interestAccrued.toString()).toBe('460');
+
+      // Every top-up uses the original pledgeDate as its interest start date.
+      // Jan 15 -> Apr 15 = 4 calendar months for all three tranches.
+      // Original: 10000 * 1% * 4 = 400
+      // Top-up 1: 1000 * 1% * 4 = 40
+      // Top-up 2: 2000 * 1% * 4 = 80
+      expect(result.interestAccrued.toString()).toBe('520');
       expect(result.principal.toString()).toBe('13000');
     });
 
@@ -351,7 +352,7 @@ describe('OutstandingService', () => {
           pledgeDate: new Date('2026-01-10T00:00:00.000Z'),
           actualLoanAmount: 8000,
           lockedInterestPercent: 3, // locked rate differs from bulk-1's — proves per-tx locking survives batching
-          topUps: [{ amount: 1000, applyPreviousInterestStartDate: true, topUpDate: new Date('2026-03-01T00:00:00.000Z') }],
+          topUps: [{ amount: 1000, topUpDate: new Date('2026-03-01T00:00:00.000Z') }],
           payments: [
             { isReversed: false, allocations: [{ category: 'PRINCIPAL', amount: 3000 }] },
             { isReversed: true, allocations: [{ category: 'PRINCIPAL', amount: 999999 }] }, // must be ignored

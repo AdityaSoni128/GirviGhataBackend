@@ -3,9 +3,10 @@ import { GirviService } from './girvi.service';
 import { GirviController } from './girvi.controller';
 import { CalculationEngineModule } from '../calculation-engine/calculation-engine.module';
 import { RulesModule } from '../rules/rules.module';
+import { PaymentsModule } from '../payments/payments.module';
 
 @Module({
-  imports: [CalculationEngineModule, RulesModule],
+  imports: [CalculationEngineModule, PaymentsModule, RulesModule],
   providers: [GirviService],
   controllers: [GirviController],
   exports: [GirviService],

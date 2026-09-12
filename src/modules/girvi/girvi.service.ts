@@ -4,12 +4,14 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { NumberSequenceService } from '../../common/numbering/number-sequence.service';
 import { RequestContext } from '../../common/decorators/current-context.decorator';
 import { CalculationEngineService } from '../calculation-engine/calculation-engine.service';
+import { OutstandingService , TransactionForOutstanding} from '../payments/outstanding.service';
 import { RulesService } from '../rules/rules.service';
 import { CreateGirviDto } from './dto/create-girvi.dto';
 import { CreateTopUpDto } from './dto/create-topup.dto';
 import { ListGirviDto } from './dto/list-girvi.dto';
 import { ItemMeasurement, RateSnapshot } from '../calculation-engine/calculation.types';
 import { parsePagination, resolveSortField, resolveSortOrder } from '../../common/pagination/pagination.util';
+import { UpdatePledgeDateDto } from './dto/update-pledge-date.dto';
 
 /** Allowlisted sort fields for GET /girvi — never pass sortBy straight into
  * Prisma `orderBy`. */
@@ -23,6 +25,7 @@ export class GirviService {
     private readonly sequences: NumberSequenceService,
     private readonly engine: CalculationEngineService,
     private readonly rules: RulesService,
+    private readonly outstandingService: OutstandingService,
   ) {}
 
   /**
@@ -335,7 +338,6 @@ export class GirviService {
           girviTransactionId: transaction.id,
           amount: amount.toString(),
           topUpDate,
-          applyPreviousInterestStartDate: dto.applyPreviousInterestStartDate,
           createdBy: ctx.userId,
         },
       });
@@ -368,7 +370,6 @@ export class GirviService {
             topUpId: topUp.id,
             amount: amount.toString(),
             topUpDate: topUpDate.toISOString(),
-            applyPreviousInterestStartDate: dto.applyPreviousInterestStartDate,
             backdated: dto.topUpDate ? topUpDate.toDateString() !== now.toDateString() : false,
           },
         },
@@ -480,6 +481,87 @@ export class GirviService {
     };
   }
 
+  async updatePledgeDate(
+    ctx: RequestContext,
+    girviId: string,
+    dto: UpdatePledgeDateDto,
+  ) {
+    const transaction = await this.prisma.girviTransaction.findFirst({
+      where: {
+        id: girviId,
+        tenantId: ctx.tenantId,
+      },
+    });
+
+    if (!transaction) {
+      throw new NotFoundException('Girvi transaction not found');
+    }
+
+    const newPledgeDate = new Date(dto.pledgeDate);
+
+    if (Number.isNaN(newPledgeDate.getTime())) {
+      throw new BadRequestException('pledgeDate is not a valid date');
+    }
+
+    const now = new Date();
+
+    if (newPledgeDate.getTime() > now.getTime()) {
+      throw new BadRequestException('Pledge date cannot be in the future');
+    }
+
+    const oldPledgeDate = transaction.pledgeDate;
+
+    if (oldPledgeDate.getTime() === newPledgeDate.getTime()) {
+      return transaction;
+    }
+
+    // Keep the existing loan-term duration intact while moving the
+    // dependent due date by the same number of days.
+    let newDueDate: Date | null = transaction.dueDate;
+
+    if (transaction.dueDate) {
+      const dateDifference =
+        newPledgeDate.getTime() - oldPledgeDate.getTime();
+
+      newDueDate = new Date(
+        transaction.dueDate.getTime() + dateDifference,
+      );
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const updatedTransaction = await tx.girviTransaction.update({
+        where: {
+          id: transaction.id,
+        },
+        data: {
+          pledgeDate: newPledgeDate,
+          dueDate: newDueDate,
+          updatedBy: ctx.userId,
+        },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          tenantId: ctx.tenantId,
+          actorId: ctx.userId,
+          action: 'GIRVI_PLEDGE_DATE_UPDATE',
+          entityType: 'GirviTransaction',
+          entityId: transaction.id,
+          oldValue: {
+            pledgeDate: oldPledgeDate.toISOString(),
+            dueDate: transaction.dueDate?.toISOString() ?? null,
+          },
+          newValue: {
+            pledgeDate: newPledgeDate.toISOString(),
+            dueDate: newDueDate?.toISOString() ?? null,
+          },
+        },
+      });
+
+      return updatedTransaction;
+    });
+  }
+
   async findOne(ctx: RequestContext, girviId: string) {
     const transaction = await this.prisma.girviTransaction.findFirst({
       where: { id: girviId, tenantId: ctx.tenantId },
@@ -513,32 +595,68 @@ export class GirviService {
     const { status, search, fromDate, toDate } = query;
 
     const dateFilter: Record<string, Date> = {};
+
     if (fromDate) {
       const d = new Date(`${fromDate}T00:00:00`);
-      if (!Number.isNaN(d.getTime())) dateFilter.gte = d;
+      if (!Number.isNaN(d.getTime())) {
+        dateFilter.gte = d;
+      }
     }
+
     if (toDate) {
       const d = new Date(`${toDate}T23:59:59.999`);
-      if (!Number.isNaN(d.getTime())) dateFilter.lte = d;
+      if (!Number.isNaN(d.getTime())) {
+        dateFilter.lte = d;
+      }
     }
 
     const where = {
       tenantId: ctx.tenantId,
       ...(status ? { status: status as any } : {}),
-      ...(Object.keys(dateFilter).length ? { pledgeDate: dateFilter } : {}),
+      ...(Object.keys(dateFilter).length
+        ? { pledgeDate: dateFilter }
+        : {}),
       ...(search
         ? {
           OR: [
-            { girviNumber: { contains: search, mode: 'insensitive' as const } },
-            { customer: { fullName: { contains: search, mode: 'insensitive' as const } } },
-            { customer: { mobile: { contains: search } } },
+            {
+              girviNumber: {
+                contains: search,
+                mode: 'insensitive' as const,
+              },
+            },
+            {
+              customer: {
+                fullName: {
+                  contains: search,
+                  mode: 'insensitive' as const,
+                },
+              },
+            },
+            {
+              customer: {
+                mobile: {
+                  contains: search,
+                },
+              },
+            },
           ],
         }
         : {}),
     };
 
-    const { page, pageSize, skip, take } = parsePagination(query.page, query.pageSize, 25);
-    const field = resolveSortField<GirviSortField>(query.sortBy, GIRVI_SORT_FIELDS, 'createdAt');
+    const { page, pageSize, skip, take } = parsePagination(
+      query.page,
+      query.pageSize,
+      25,
+    );
+
+    const field = resolveSortField<GirviSortField>(
+      query.sortBy,
+      GIRVI_SORT_FIELDS,
+      'createdAt',
+    );
+
     const order = resolveSortOrder(query.sortOrder);
 
     const [rows, total] = await this.prisma.$transaction([
@@ -551,19 +669,75 @@ export class GirviService {
           pledgeDate: true,
           dueDate: true,
           createdAt: true,
-          customer: { select: { id: true, fullName: true, mobile: true, customerCode: true } },
-          valuation: { select: { actualLoanAmount: true } },
-          topUps: { select: { amount: true } }
+
+          customer: {
+            select: {
+              id: true,
+              fullName: true,
+              mobile: true,
+              customerCode: true,
+            },
+          },
+
+          valuation: {
+            select: {
+              actualLoanAmount: true,
+              interestPercent: true,
+            },
+          },
+
+          topUps: {
+            select: {
+              amount: true,
+              topUpDate: true,
+            },
+          },
+
+          payments: {
+            where: {
+              isReversed: false,
+            },
+            select: {
+              allocations: {
+                select: {
+                  category: true,
+                  amount: true,
+                },
+              },
+            },
+          },
+
+          items: {
+            select: {
+              metalCode: true,
+            },
+          },
         },
-        // `id` as a secondary sort key keeps pagination deterministic when
-        // many rows share the same primary sort value.
+
         orderBy: [{ [field]: order }, { id: 'desc' }],
         skip,
         take,
       }),
-      this.prisma.girviTransaction.count({ where }),
+
+      this.prisma.girviTransaction.count({
+        where,
+      }),
     ]);
+
+    const outstandingMap =
+      await this.outstandingService.computeOutstandingForPreloaded(
+        ctx.tenantId,
+        rows as TransactionForOutstanding[],
+      );
+
     const results = rows.map((row) => {
+      const totalPledgeMonths = row.pledgeDate
+        ? this.engine.calculateCalendarMonthsElapsed(
+          row.pledgeDate,
+          new Date(),
+        )
+        : 0;
+
       const originalLoanAmount = row.valuation?.actualLoanAmount
         ? new Decimal(row.valuation.actualLoanAmount.toString())
         : new Decimal(0);
@@ -573,11 +747,25 @@ export class GirviService {
         new Decimal(0),
       );
 
+      const outstanding = outstandingMap.get(row.id);
+
       return {
         ...row,
-        loanAmount: originalLoanAmount.plus(totalTopUpAmount).toString(),
+
+        loanAmount: originalLoanAmount
+          .plus(totalTopUpAmount)
+          .toString(),
+
+        totalPledgeMonths,
+
+        interestPercent:
+          row.valuation?.interestPercent?.toString() ?? null,
+
+        interestAccrued:
+          outstanding?.interestAccrued?.toString() ?? '0',
       };
     });
+
     return {
       results,
       total,
